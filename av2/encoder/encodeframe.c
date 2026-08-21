@@ -69,6 +69,7 @@
 #include "av2/encoder/segmentation.h"
 #include "av2/encoder/tokenize.h"
 #include "av2/encoder/tpl_model.h"
+#include "av2/encoder/var_based_part.h"
 
 #if CONFIG_TUNE_VMAF
 #include "av2/encoder/tune_vmaf.h"
@@ -467,12 +468,15 @@ static INLINE void init_encode_rd_sb(AV2_COMP *cpi, ThreadData *td,
   reset_hash_records(&x->txfm_search_info, cpi->sf.tx_sf.use_inter_txb_hash);
   av2_zero(x->picked_ref_frames_mask);
   av2_invalid_rd_stats(rd_cost);
-  SimpleMotionDataBufs *data_bufs = x->sms_bufs;
-  av2_init_sms_data_bufs(data_bufs);
-  fill_sms_buf(data_bufs, sms_root, mi_row, mi_col, cm->sb_size, cm->sb_size,
-               0);
-  fill_sms_buf(data_bufs, sms_root, mi_row, mi_col, cm->sb_size, cm->sb_size,
-               1);
+  if (sf->part_sf.partition_search_type != VAR_BASED_PARTITION &&
+      sf->part_sf.partition_search_type != FIXED_PARTITION) {
+    SimpleMotionDataBufs *data_bufs = x->sms_bufs;
+    av2_init_sms_data_bufs(data_bufs);
+    fill_sms_buf(data_bufs, sms_root, mi_row, mi_col, cm->sb_size, cm->sb_size,
+                 0);
+    fill_sms_buf(data_bufs, sms_root, mi_row, mi_col, cm->sb_size, cm->sb_size,
+                 1);
+  }
   if (x->e_mbd.tree_type == CHROMA_PART) {
     assert(is_bsize_square(x->sb_enc.min_partition_size));
     x->sb_enc.min_partition_size =
@@ -590,12 +594,18 @@ static AVM_INLINE void perform_two_partition_passes(
                              SB_WET_PASS, NULL);
 }
 
-/*!\brief Set all tree nodes <= min_bsize to PARTITION_INVALID.
+/*!\brief Mark the small nodes of the dry-pass tree as "search again".
  *
  * \ingroup partition_search
+ *
+ * The wet pass trusts the dry-pass shape for large blocks and searches the
+ * small ones again. This walks the dry-pass tree and clears the shape of every
+ * node smaller than min_bsize so the wet pass is free to choose its own.
  */
 static AVM_INLINE void set_min_none_to_invalid(PARTITION_TREE *part_tree,
-                                               BLOCK_SIZE min_bsize) {
+                                               BLOCK_SIZE min_bsize,
+                                               bool allow_none_resplit) {
+  if (!part_tree) return;
   const BLOCK_SIZE bsize = part_tree->bsize;
   const PARTITION_TYPE part_type = part_tree->partition;
   if (!is_bsize_geq(bsize, min_bsize)) {
@@ -604,7 +614,19 @@ static AVM_INLINE void set_min_none_to_invalid(PARTITION_TREE *part_tree,
       av2_free_ptree_recursive(part_tree->sub_tree[idx]);
       part_tree->sub_tree[idx] = NULL;
     }
+    return;
+  }
 
+  // Large blocks the dry pass left unsplit: re-split them in the wet pass
+  // (only on the fast level, guarded by allow_none_resplit). The conservative
+  // level keeps its pre-PR semantics.
+  if (allow_none_resplit && part_type == PARTITION_NONE) {
+    // Only do this for blocks up to 128 px. Bigger unsplit blocks are usually
+    // genuinely flat, so searching them again costs a lot of time for little
+    // gain.
+    if (AVMMAX(block_size_wide[bsize], block_size_high[bsize]) <= 128) {
+      part_tree->partition = PARTITION_INVALID;
+    }
     return;
   }
 
@@ -626,7 +648,8 @@ static AVM_INLINE void set_min_none_to_invalid(PARTITION_TREE *part_tree,
   }
 
   for (int idx = 0; idx < num_subtrees; idx++) {
-    set_min_none_to_invalid(part_tree->sub_tree[idx], min_bsize);
+    set_min_none_to_invalid(part_tree->sub_tree[idx], min_bsize,
+                            allow_none_resplit);
   }
 }
 
@@ -640,7 +663,8 @@ static AVM_INLINE void set_min_none_to_invalid(PARTITION_TREE *part_tree,
  */
 static AVM_INLINE void perform_two_pass_partition_search(
     AV2_COMP *cpi, ThreadData *td, TileDataEnc *tile_data, TokenExtra **tp,
-    TokenExtra **tp_chroma, const int mi_row, const int mi_col) {
+    TokenExtra **tp_chroma, const int mi_row, const int mi_col,
+    bool fast_two_pass) {
   SIMPLE_MOTION_DATA_TREE *const sms_root = td->sms_root;
   AV2_COMMON *const cm = &cpi->common;
   MACROBLOCK *const x = &td->mb;
@@ -649,17 +673,20 @@ static AVM_INLINE void perform_two_pass_partition_search(
   const BLOCK_SIZE sb_size = cm->sb_size;
   assert(!frame_is_intra_only(cm));
 
-  // First pass to estimate  partition structures
+  // First pass to estimate partition structures
   SB_FIRST_PASS_STATS sb_fp_stats;
   av2_backup_sb_state(&sb_fp_stats, cpi, td, tile_data, mi_row, mi_col);
-  const BLOCK_SIZE fp_min_bsize = BLOCK_16X16;
-  x->sb_enc.min_partition_size = fp_min_bsize;
+  // The dry pass does not go below 16x16: it only needs a rough shape, and it
+  // scores blocks with a reduced set of tools.
+  x->sb_enc.min_partition_size = BLOCK_16X16;
   perform_one_partition_pass(cpi, td, tile_data, tp, tp_chroma, mi_row, mi_col,
                              SB_DRY_PASS, NULL);
   PARTITION_TREE *part_ref = xd->sbi->ptree_root[0];
   // Set this to NULL otherwise part_ref will get freed in the second pass.
   xd->sbi->ptree_root[0] = NULL;
-  set_min_none_to_invalid(part_ref, get_larger_sqr_bsize(fp_min_bsize));
+  // Trust the dry-pass shape for >=32x32 blocks; re-search smaller ones.
+  set_min_none_to_invalid(part_ref, get_larger_sqr_bsize(BLOCK_16X16),
+                          fast_two_pass);
 
   // Second pass
   RD_STATS dummy_rdc;
@@ -730,7 +757,7 @@ static AVM_INLINE void encode_rd_sb(AV2_COMP *cpi, ThreadData *td,
                         mi_col, 1);
       av2_reset_ptree_in_sbi(xd->sbi, xd->tree_type);
       av2_build_partition_tree_fixed_partitioning(
-          cm, xd->tree_type, mi_row, mi_col, bsize,
+          cm, xd->tree_type, mi_row, mi_col,
           xd->sbi->ptree_root[av2_get_sdp_idx(xd->tree_type)],
           xd->tree_type == CHROMA_PART ? xd->sbi->ptree_root[0] : NULL);
       PC_TREE *const pc_root = av2_alloc_pc_tree_node(
@@ -765,7 +792,7 @@ static AVM_INLINE void encode_rd_sb(AV2_COMP *cpi, ThreadData *td,
           PARTITION_NONE, 0, 1, ss_x, ss_y);
       av2_reset_ptree_in_sbi(xd->sbi, xd->tree_type);
       av2_build_partition_tree_fixed_partitioning(
-          cm, xd->tree_type, mi_row, mi_col, bsize,
+          cm, xd->tree_type, mi_row, mi_col,
           xd->sbi->ptree_root[av2_get_sdp_idx(xd->tree_type)],
           xd->tree_type == CHROMA_PART ? xd->sbi->ptree_root[0] : NULL);
       av2_rd_use_partition(
@@ -775,6 +802,59 @@ static AVM_INLINE void encode_rd_sb(AV2_COMP *cpi, ThreadData *td,
           xd->sbi->ptree_root[av2_get_sdp_idx(xd->tree_type)], pc_root,
           (xd->tree_type == CHROMA_PART) ? xd->sbi->ptree_root[0] : NULL);
       av2_free_pc_tree_recursive(pc_root, num_planes, 0, 0);
+      x->sb_enc.min_partition_size = min_partition_size;
+    }
+    xd->tree_type = SHARED_PART;
+  } else if (sf->part_sf.partition_search_type == VAR_BASED_PARTITION) {
+    av2_set_offsets(cpi, tile_info, x, mi_row, mi_col, sb_size, NULL);
+    av2_choose_var_based_partitioning(cpi, tile_info, td, x, mi_row, mi_col);
+    for (int loop_idx = 0; loop_idx < total_loop_num; loop_idx++) {
+      xd->tree_type =
+          (total_loop_num == 1 ? SHARED_PART
+                               : (loop_idx == 0 ? LUMA_PART : CHROMA_PART));
+      const int plane_start = get_partition_plane_start(xd->tree_type);
+      const int plane_end = get_partition_plane_end(xd->tree_type, num_planes);
+      const BLOCK_SIZE min_partition_size = x->sb_enc.min_partition_size;
+      init_encode_rd_sb(cpi, td, tile_data, sms_root, &dummy_rdc, mi_row,
+                        mi_col, 1);
+      PC_TREE *pc_root;
+      if (cpi->sf.rt_sf.use_nonrd_partition) {
+        if (!td->pc_root) {
+          td->pc_root = av2_alloc_pc_tree_node(
+              xd->tree_type, mi_row, mi_col, cm->sb_size, sb_size, NULL,
+              PARTITION_NONE, 0, 1, ss_x, ss_y);
+        }
+        pc_root = td->pc_root;
+      } else {
+        pc_root = av2_alloc_pc_tree_node(xd->tree_type, mi_row, mi_col,
+                                         cm->sb_size, sb_size, NULL,
+                                         PARTITION_NONE, 0, 1, ss_x, ss_y);
+      }
+      av2_reset_ptree_in_sbi(xd->sbi, xd->tree_type);
+      av2_build_partition_tree_fixed_partitioning(
+          cm, xd->tree_type, mi_row, mi_col,
+          xd->sbi->ptree_root[av2_get_sdp_idx(xd->tree_type)],
+          xd->tree_type == CHROMA_PART ? xd->sbi->ptree_root[0] : NULL);
+      for (int plane = plane_start; plane < plane_end; plane++) {
+        x->cb_offset[plane] = 0;
+      }
+      TokenExtra **const tp_start =
+          (intra_sdp_enabled && xd->tree_type == CHROMA_PART) ? tp_chroma : tp;
+      PARTITION_TREE *const ptree_luma =
+          (xd->tree_type == CHROMA_PART) ? xd->sbi->ptree_root[0] : NULL;
+      if (cpi->sf.rt_sf.use_nonrd_partition) {
+        av2_nonrd_use_partition(
+            cpi, td, tile_data, mi, tp_start, mi_row, mi_col, sb_size,
+            xd->sbi->ptree_root[av2_get_sdp_idx(xd->tree_type)], pc_root,
+            ptree_luma);
+      } else {
+        av2_rd_use_partition(
+            cpi, td, tile_data, mi, tp_start, mi_row, mi_col, sb_size,
+            &dummy_rate, &dummy_dist, 1,
+            xd->sbi->ptree_root[av2_get_sdp_idx(xd->tree_type)], pc_root,
+            ptree_luma);
+        av2_free_pc_tree_recursive(pc_root, num_planes, 0, 0);
+      }
       x->sb_enc.min_partition_size = min_partition_size;
     }
     xd->tree_type = SHARED_PART;
@@ -803,9 +883,13 @@ static AVM_INLINE void encode_rd_sb(AV2_COMP *cpi, ThreadData *td,
                                    mi_col);
     } else if (!frame_is_intra_only(cm) &&
                bru_is_sb_active(cm, mi_col, mi_row) &&
-               sf->part_sf.two_pass_partition_search) {
-      perform_two_pass_partition_search(cpi, td, tile_data, tp, tp_chroma,
-                                        mi_row, mi_col);
+               av2_two_pass_part_enabled(&sf->part_sf)) {
+      // TODO(Yeqing): Add an SB-level heuristic to skip the second pass on
+      // SBs where a single pass is good enough, to reduce encoding time.
+      // Only the fast level opts into the extra re-split of unsplit blocks.
+      perform_two_pass_partition_search(
+          cpi, td, tile_data, tp, tp_chroma, mi_row, mi_col,
+          av2_two_pass_part_is_fast(&sf->part_sf));
     } else {
       perform_one_partition_pass(cpi, td, tile_data, tp, tp_chroma, mi_row,
                                  mi_col, SB_SINGLE_PASS, NULL);
@@ -2110,10 +2194,18 @@ static AVM_INLINE void encode_frame_internal(AV2_COMP *cpi) {
     enc_row_mt->sync_write_ptr = av2_row_mt_sync_write;
     av2_encode_tiles_row_mt(cpi);
   } else {
-    if (AVMMIN(mt_info->num_workers, cm->tiles.cols * cm->tiles.rows) > 1)
+    if (AVMMIN(mt_info->num_workers, cm->tiles.cols * cm->tiles.rows) > 1) {
       av2_encode_tiles_mt(cpi);
-    else
+    } else {
+      if (cpi->sf.rt_sf.use_nonrd_partition) {
+        cpi->td.pc_root = av2_alloc_pc_tree_node(
+            SHARED_PART, 0, 0, cm->sb_size, cm->sb_size, NULL, PARTITION_NONE,
+            0, 1, cm->seq_params.subsampling_x, cm->seq_params.subsampling_y);
+      }
       encode_tiles(cpi);
+      av2_free_pc_tree_recursive(cpi->td.pc_root, av2_num_planes(cm), 0, 0);
+      cpi->td.pc_root = NULL;
+    }
   }
 
   // If intrabc is allowed but never selected, reset the allow_intrabc flag.

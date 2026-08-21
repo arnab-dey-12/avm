@@ -1159,25 +1159,6 @@ static void set_max_bvp_drl_bits(struct AV2_COMP *cpi) {
          cm->features.max_bvp_drl_bits <= MAX_MAX_IBC_DRL_BITS);
 }
 
-static void set_seq_lr_tools_mask(SequenceHeader *const seq_params,
-                                  const AV2EncoderConfig *oxcf) {
-  const ToolCfg *const tool_cfg = &oxcf->tool_cfg;
-  seq_params->lr_tools_disable_mask[0] = 0;  // default - no tools disabled
-  seq_params->lr_tools_disable_mask[1] = 0;  // default - no tools disabled
-
-  // Parse oxcf here to disable tools as requested through cmd lines
-  if (!tool_cfg->enable_pc_wiener) {
-    seq_params->lr_tools_disable_mask[0] |= (1 << RESTORE_PC_WIENER);
-    seq_params->lr_tools_disable_mask[1] |= (1 << RESTORE_PC_WIENER);
-  }
-  if (!tool_cfg->enable_wiener_nonsep) {
-    seq_params->lr_tools_disable_mask[0] |= (1 << RESTORE_WIENER_NONSEP);
-    seq_params->lr_tools_disable_mask[1] |= (1 << RESTORE_WIENER_NONSEP);
-  }
-
-  seq_params->lr_tools_disable_mask[1] |= DEF_UV_LR_TOOLS_DISABLE_MASK;
-}
-
 void av2_change_config(struct AV2_COMP *cpi, const AV2EncoderConfig *oxcf) {
   AV2_COMMON *const cm = &cpi->common;
   SequenceHeader *const seq_params = &cm->seq_params;
@@ -1425,6 +1406,8 @@ void av2_change_config(struct AV2_COMP *cpi, const AV2EncoderConfig *oxcf) {
       av2_free_shared_coeff_buffer(&cpi->td.shared_coeff_buf);
       av2_free_sms_tree(&cpi->td);
       av2_free_sms_bufs(&cpi->td);
+      av2_free_pc_tree_recursive(cpi->td.pc_root, av2_num_planes(cm), 0, 0);
+      cpi->td.pc_root = NULL;
 #if CONFIG_ML_PART_SPLIT
       av2_part_prune_tflite_close(&(cpi->td.partition_model));
 #endif  // CONFIG_ML_PART_SPLIT
@@ -1453,7 +1436,6 @@ void av2_change_config(struct AV2_COMP *cpi, const AV2EncoderConfig *oxcf) {
   // This should not be called after the first key frame.
   if (!cpi->seq_params_locked) {
     av2_init_seq_coding_tools(cpi, &cm->seq_params, cm, oxcf);
-    if (seq_params->enable_restoration) set_seq_lr_tools_mask(seq_params, oxcf);
   }
 
   // restore the value of lag_in_frame for LAP stage.
@@ -1827,8 +1809,15 @@ static AVM_INLINE void free_thread_data(AV2_COMP *cpi) {
     av2_free_pmc(thread_data->td->firstpass_ctx, av2_num_planes(cm));
     thread_data->td->firstpass_ctx = NULL;
     av2_free_shared_coeff_buffer(&thread_data->td->shared_coeff_buf);
+    avm_free(thread_data->td->vt128x128);
+    thread_data->td->vt128x128 = NULL;
+    avm_free(thread_data->td->vt64x64);
+    thread_data->td->vt64x64 = NULL;
     av2_free_sms_tree(thread_data->td);
     av2_free_sms_bufs(thread_data->td);
+    av2_free_pc_tree_recursive(thread_data->td->pc_root, av2_num_planes(cm), 0,
+                               0);
+    thread_data->td->pc_root = NULL;
 #if CONFIG_ML_PART_SPLIT
     av2_part_prune_tflite_close(&(thread_data->td->partition_model));
 #endif  // CONFIG_ML_PART_SPLIT
@@ -2557,6 +2546,8 @@ int av2_set_size_literal(AV2_COMP *cpi, int width, int height) {
       av2_free_shared_coeff_buffer(&cpi->td.shared_coeff_buf);
       av2_free_sms_tree(&cpi->td);
       av2_free_sms_bufs(&cpi->td);
+      av2_free_pc_tree_recursive(cpi->td.pc_root, av2_num_planes(cm), 0, 0);
+      cpi->td.pc_root = NULL;
 #if CONFIG_ML_PART_SPLIT
       av2_part_prune_tflite_close(&(cpi->td.partition_model));
 #endif  // CONFIG_ML_PART_SPLIT
@@ -3040,39 +3031,34 @@ static void avm_band_search(AV2_COMP *cpi, AV2_COMMON *cm, MACROBLOCKD *xd) {
 static void cdef_restoration_frame(AV2_COMP *cpi, AV2_COMMON *cm,
                                    MACROBLOCKD *xd, int use_restoration,
                                    int use_cdef, int use_gdf) {
-  uint16_t *rec_uv[CCSO_NUM_COMPONENTS];
-  uint16_t *org_uv[CCSO_NUM_COMPONENTS];
   uint16_t *ext_rec_y = NULL;
-  uint16_t *ref_buffer;
-  const YV12_BUFFER_CONFIG *ref = cpi->source;
-  int ref_stride;
   const int use_ccso =
       !cm->features.coded_lossless && !cm->bru.frame_inactive_flag &&
       !cm->bridge_frame_info.is_bridge_frame && cm->seq_params.enable_ccso;
   const int num_planes = av2_num_planes(cm);
+
   av2_setup_dst_planes(xd->plane, &cm->cur_frame->buf, 0, 0, 0, num_planes,
                        NULL);
-  const int ccso_stride = xd->plane[0].dst.width;
-  for (int pli = 0; pli < num_planes; pli++) {
-    rec_uv[pli] = avm_malloc(sizeof(*rec_uv[pli]) * xd->plane[0].dst.height *
-                             ccso_stride);
-    org_uv[pli] = avm_malloc(sizeof(*org_uv[pli]) * xd->plane[0].dst.height *
-                             ccso_stride);
-  }
   if (use_ccso) {
+    const int ccso_stride = xd->plane[AVM_PLANE_Y].dst.width;
+    const int ccso_height = xd->plane[AVM_PLANE_Y].dst.height;
+    const int ccso_stride_ext = ccso_stride + (CCSO_PADDING_SIZE << 1);
+    const int ccso_height_ext = ccso_height + (CCSO_PADDING_SIZE << 1);
+    CHECK_MEM_ERROR(
+        cm, ext_rec_y,
+        avm_malloc(sizeof(*ext_rec_y) * ccso_stride_ext * ccso_height_ext));
+
     const int pic_height = cm->cur_frame->buf.y_height;
     const int pic_width = cm->cur_frame->buf.y_width;
     const int dst_stride = cm->cur_frame->buf.y_stride;
-    const uint16_t *rec_y = cm->cur_frame->buf.y_buffer;
-    const int ccso_stride_ext = pic_width + (CCSO_PADDING_SIZE << 1);
-    ext_rec_y = avm_malloc(sizeof(*ext_rec_y) *
-                           (pic_height + (CCSO_PADDING_SIZE << 1)) *
-                           (pic_width + (CCSO_PADDING_SIZE << 1)));
+    uint16_t *rec_y = cm->cur_frame->buf.y_buffer;
+    uint16_t *ext_rec_y_row =
+        ext_rec_y + CCSO_PADDING_SIZE + (CCSO_PADDING_SIZE * ccso_stride_ext);
+
     for (int r = 0; r < pic_height; ++r) {
-      for (int c = 0; c < pic_width; ++c) {
-        ext_rec_y[(r + CCSO_PADDING_SIZE) * ccso_stride_ext + c +
-                  CCSO_PADDING_SIZE] = rec_y[r * dst_stride + c];
-      }
+      av2_copy_array(ext_rec_y_row, rec_y, pic_width);
+      ext_rec_y_row += ccso_stride_ext;
+      rec_y += dst_stride;
     }
     extend_ccso_border(&cm->cur_frame->buf, ext_rec_y, CCSO_PADDING_SIZE);
   }
@@ -3115,61 +3101,70 @@ static void cdef_restoration_frame(AV2_COMP *cpi, AV2_COMMON *cm,
     cm->cdef_info.cdef_frame_enable = 0;
     // if not use ccso, need to init
     cm->ccso_info.ccso_frame_flag = false;
-    cm->ccso_info.ccso_enable[0] = cm->ccso_info.ccso_enable[1] =
-        cm->ccso_info.ccso_enable[2] = 0;
-    for (int plane = 0; plane < av2_num_planes(cm); plane++) {
-      cm->cur_frame->ccso_info.ccso_enable[plane] = 0;
+    for (int plane = AVM_PLANE_Y; plane < num_planes; ++plane) {
+      cm->cur_frame->ccso_info.ccso_enable[plane] = false;
+      cm->ccso_info.ccso_enable[plane] = false;
       cm->ccso_info.sb_reuse_ccso[plane] = false;
       cm->ccso_info.reuse_ccso[plane] = false;
     }
   }
+
   if (use_ccso) {
     av2_setup_dst_planes(xd->plane, &cm->cur_frame->buf, 0, 0, 0, num_planes,
                          NULL);
-    // Reading original and reconstructed chroma samples as input
-    for (int pli = 0; pli < num_planes; pli++) {
-      const int pic_height = xd->plane[pli].dst.height;
-      const int pic_width = xd->plane[pli].dst.width;
-      const int dst_stride = xd->plane[pli].dst.stride;
-      switch (pli) {
-        case 0:
-          ref_buffer = ref->y_buffer;
-          ref_stride = ref->y_stride;
-          break;
-        case 1:
-          ref_buffer = ref->u_buffer;
-          ref_stride = ref->uv_stride;
-          break;
-        case 2:
-          ref_buffer = ref->v_buffer;
-          ref_stride = ref->uv_stride;
-          break;
-        default: ref_stride = 0;
-      }
+
+    uint16_t *rec_uv[CCSO_NUM_COMPONENTS];
+    uint16_t *org_uv[CCSO_NUM_COMPONENTS];
+    const int ccso_stride = xd->plane[AVM_PLANE_Y].dst.width;
+    const int ccso_height = xd->plane[AVM_PLANE_Y].dst.height;
+    for (int plane = AVM_PLANE_Y; plane < num_planes; ++plane) {
+      CHECK_MEM_ERROR(
+          cm, rec_uv[plane],
+          avm_malloc(sizeof(*rec_uv[plane]) * ccso_height * ccso_stride));
+      CHECK_MEM_ERROR(
+          cm, org_uv[plane],
+          avm_malloc(sizeof(*org_uv[plane]) * ccso_height * ccso_stride));
+
+      // Reading original and reconstructed chroma samples as input
+      const YV12_BUFFER_CONFIG *src = cpi->source;
+      uint16_t *rec_buffer = xd->plane[plane].dst.buf;
+      uint16_t *src_cpy = org_uv[plane];
+      uint16_t *rec_cpy = rec_uv[plane];
+      const int pic_height = xd->plane[plane].dst.height;
+      const int pic_width = xd->plane[plane].dst.width;
+      const int rec_stride = xd->plane[plane].dst.stride;
+      uint16_t *src_buffer = src->buffers[plane];
+      int src_stride = src->strides[plane == AVM_PLANE_Y ? 0 : 1];
+
       for (int r = 0; r < pic_height; ++r) {
-        for (int c = 0; c < pic_width; ++c) {
-          rec_uv[pli][r * ccso_stride + c] =
-              xd->plane[pli].dst.buf[r * dst_stride + c];
-          org_uv[pli][r * ccso_stride + c] = ref_buffer[r * ref_stride + c];
-        }
+        av2_copy_array(src_cpy, src_buffer, pic_width);
+        src_buffer += src_stride;
+
+        av2_copy_array(rec_cpy, rec_buffer, pic_width);
+        rec_buffer += rec_stride;
+
+        rec_cpy += ccso_stride;
+        src_cpy += ccso_stride;
       }
     }
-    ccso_search(cm, xd, cpi->td.mb.rdmult, ext_rec_y, rec_uv, org_uv,
-                cpi->error_resilient_frame_seen
+    av2_ccso_search(cm, xd, cpi->td.mb.rdmult, ext_rec_y, rec_uv, org_uv,
+                    cpi->error_resilient_frame_seen
 #if CONFIG_ENTROPY_STATS
-                ,
-                &cpi->td
+                    ,
+                    &cpi->td
 #endif
-    );
+                    ,
+                    cpi->sf.lpf_sf.early_terminate_ccso_search_by_cost,
+                    cpi->sf.lpf_sf.ccso_chroma_dep);
     ccso_frame(&cm->cur_frame->buf, cm, xd, ext_rec_y);
 #if CONFIG_MISMATCH_DEBUG
     mismatch_record_frame(&cm->cur_frame->buf, num_planes, 2);
 #endif
     avm_free(ext_rec_y);
-  }
-  for (int pli = 0; pli < num_planes; pli++) {
-    avm_free(rec_uv[pli]);
-    avm_free(org_uv[pli]);
+    for (int plane = AVM_PLANE_Y; plane < num_planes; ++plane) {
+      avm_free(rec_uv[plane]);
+      avm_free(org_uv[plane]);
+    }
   }
 
   if (use_gdf) {

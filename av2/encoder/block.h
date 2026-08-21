@@ -1647,6 +1647,16 @@ typedef struct macroblock {
   MB_MODE_INFO *inter_mode_cache[NUMBER_OF_CACHED_MODES];
   /*! \brief Whether the whole superblock is inside the frame boudnary */
   bool is_whole_sb;
+
+  /*! \brief True during the dry pass of the SB-level two-pass partition
+   * search; gates the block-level dry-pass shortcuts. */
+  bool apply_dry_pass_shortcuts;
+
+  /*! \brief Cap on top intra Y candidates for full RD. */
+  int intra_mode_prune_top;
+
+  /*! \brief Cap on top inter motion-mode candidates for full RD. */
+  int inter_mode_prune_top;
   /**@}*/
 
   /*! \brief Quantization state of a transform coefficient.
@@ -1669,6 +1679,10 @@ typedef struct macroblock {
    * evaluation. */
   int64_t top_tx_part_rd_inter[MAX_TX_BLOCKS_IN_MAX_SB]
                               [TOP_INTER_TX_PART_COUNT];
+  /*! \brief Keep records of top estimated rdcosts of compound type search,
+   * which are used for pruning compound modes in inter mode
+   * evaluation. */
+  int64_t top_comp_est_rd[TOP_COMP_EST_RD_COUNT];
 } MACROBLOCK;
 #undef SINGLE_REF_MODES
 

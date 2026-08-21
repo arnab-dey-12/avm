@@ -1574,6 +1574,83 @@ typedef struct inter_modes_info {
   RdIdxPair rd_idx_pair_arr[MAX_INTER_MODES];
 } InterModesInfo;
 
+/*!\cond */
+typedef struct {
+  // This struct is used for computing variance in choose_partitioning(), where
+  // the max number of samples within a superblock is 32x32 (with 4x4 avg).
+  // uint64_t is used for sum_square_error to prevent overflow in high bitdepth
+  // mode.
+  uint64_t sum_square_error;
+  int32_t sum_error;
+  int log2_count;
+  int variance;
+} VPartVar;
+
+typedef struct {
+  VPartVar none;
+  VPartVar horz[2];
+  VPartVar vert[2];
+} VPVariance;
+
+typedef struct {
+  VPVariance part_variances;
+  VPartVar split[4];
+} VP4x4;
+
+typedef struct {
+  VPVariance part_variances;
+  VP4x4 split[4];
+} VP8x8;
+
+typedef struct {
+  VPVariance part_variances;
+  VP8x8 split[4];
+} VP16x16;
+
+typedef struct {
+  VPVariance part_variances;
+  VP16x16 split[4];
+} VP32x32;
+
+typedef struct {
+  VPVariance part_variances;
+  VP32x32 split[4];
+} VP64x64;
+
+typedef struct {
+  VPVariance part_variances;
+  VP64x64 *split;
+} VP128x128;
+
+typedef struct {
+  VPVariance part_variances;
+  VP128x128 *split;
+} VP256x256;
+
+/*!\endcond */
+
+/*!
+ * \brief Thresholds for variance based partitioning.
+ */
+typedef struct {
+  /*!
+   * If block variance > threshold, then that block is forced to split.
+   * thresholds[0] - threshold for 256x256;
+   * thresholds[1] - threshold for 128x128;
+   * thresholds[2] - threshold for 64x64;
+   * thresholds[3] - threshold for 32x32;
+   * thresholds[4] - threshold for 16x16;
+   * thresholds[5] - threshold for 8x8;
+   */
+  int64_t thresholds[6];
+
+  /*!
+   * MinMax variance threshold for 8x8 sub blocks of a 16x16 block. If actual
+   * minmax > threshold_minmax, the 16x16 is forced to split.
+   */
+  int64_t threshold_minmax;
+} VarBasedPartitionInfo;
+
 /*!
  * \brief Encoder parameters for synchronization of row based multi-threading
  */
@@ -1664,10 +1741,15 @@ typedef struct ThreadData {
   // Buffer used to store quantized and dequantized transform coefficients.
   coeff_info *coef_info;
   PICK_MODE_CONTEXT *firstpass_ctx;
+  VP128x128 *vt128x128;
+  VP64x64 *vt64x64;
 #if CONFIG_ML_PART_SPLIT
   void *partition_model;
 #endif  // CONFIG_ML_PART_SPLIT
   void *dip_pruning_model;
+  // Root node for pre-allocated partition context tree (PC_TREE) reused
+  // across superblocks in real-time non-RD mode.
+  struct PC_TREE *pc_root;
 } ThreadData;
 
 struct EncWorkerData;
@@ -2733,6 +2815,11 @@ typedef struct AV2_COMP {
   int vaq_refresh;
 
   /*!
+   * Thresholds for variance based partitioning.
+   */
+  VarBasedPartitionInfo vbp_info;
+
+  /*!
    * Probabilities for pruning of various AV2 tools.
    */
   FrameProbInfo frame_probs;
@@ -3614,6 +3701,25 @@ static INLINE void check_ref_count_status_enc(AV2_COMP *cpi) {
 static INLINE bool av2_is_shown_keyframe(const AV2_COMP *cpi,
                                          FRAME_TYPE frame_type) {
   return (frame_type == KEY_FRAME) && !cpi->no_show_fwd_kf;
+}
+
+static INLINE void av2_set_seq_lr_tools_mask(SequenceHeader *const seq_params,
+                                             const AV2EncoderConfig *oxcf) {
+  const ToolCfg *const tool_cfg = &oxcf->tool_cfg;
+  seq_params->lr_tools_disable_mask[0] = 0;  // default - no tools disabled
+  seq_params->lr_tools_disable_mask[1] = 0;  // default - no tools disabled
+
+  // Parse oxcf here to disable tools as requested through cmd lines
+  if (!tool_cfg->enable_pc_wiener) {
+    seq_params->lr_tools_disable_mask[0] |= (1 << RESTORE_PC_WIENER);
+    seq_params->lr_tools_disable_mask[1] |= (1 << RESTORE_PC_WIENER);
+  }
+  if (!tool_cfg->enable_wiener_nonsep) {
+    seq_params->lr_tools_disable_mask[0] |= (1 << RESTORE_WIENER_NONSEP);
+    seq_params->lr_tools_disable_mask[1] |= (1 << RESTORE_WIENER_NONSEP);
+  }
+
+  seq_params->lr_tools_disable_mask[1] |= DEF_UV_LR_TOOLS_DISABLE_MASK;
 }
 
 /*!\endcond */

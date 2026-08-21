@@ -18,11 +18,11 @@
 
 namespace {
 // This class is used to validate realtime encoding path.
-class RtcTestLarge : public ::libavm_test::CodecTestWithParam<int>,
-                     public ::libavm_test::EncoderTest {
+class RtcTest : public ::libavm_test::CodecTestWithParam<int>,
+                public ::libavm_test::EncoderTest {
  protected:
-  RtcTestLarge() : EncoderTest(GET_PARAM(0)), tune_content_(GET_PARAM(1)) {}
-  virtual ~RtcTestLarge() {}
+  RtcTest() : EncoderTest(GET_PARAM(0)), tune_content_(GET_PARAM(1)) {}
+  virtual ~RtcTest() {}
 
   virtual void SetUp() {
     const avm_codec_err_t res =
@@ -71,7 +71,7 @@ class RtcTestLarge : public ::libavm_test::CodecTestWithParam<int>,
       encoder->Control(AV2E_SET_QUANT_B_ADAPT, 0);
       encoder->Control(AV2E_SET_ENABLE_TPL_MODEL, 0);
       encoder->Control(AV2E_SET_FRAME_PERIODIC_BOOST, 0);
-      encoder->Control(AV2E_SET_MAX_REFERENCE_FRAMES, 3);
+      encoder->Control(AV2E_SET_MAX_REFERENCE_FRAMES, 1);
       encoder->Control(AV2E_SET_REDUCED_REFERENCE_SET, 1);
       encoder->Control(AV2E_SET_ENABLE_REF_FRAME_MVS, 0);
       encoder->Control(AV2E_SET_ENABLE_QM, 0);
@@ -90,6 +90,37 @@ class RtcTestLarge : public ::libavm_test::CodecTestWithParam<int>,
       encoder->Control(AV2E_SET_COEFF_COST_UPD_FREQ, 2);
       encoder->Control(AV2E_SET_MODE_COST_UPD_FREQ, 2);
       encoder->Control(AV2E_SET_MV_COST_UPD_FREQ, 3);
+      // The following settings don't have codec control assigned yet.
+      encoder->SetOption("enable-sdp", "0");
+      encoder->SetOption("enable-extended-sdp", "0");
+      encoder->SetOption("enable-mhccp", "0");
+      encoder->SetOption("enable-mrls", "0");
+      encoder->SetOption("enable-tip", "0");
+      encoder->SetOption("enable-bawp", "0");
+      encoder->SetOption("enable-cwp", "0");
+      encoder->SetOption("enable-imp-msk-bld", "0");
+      encoder->SetOption("enable-ist", "0");
+      encoder->SetOption("enable-inter-ist", "0");
+      encoder->SetOption("enable-inter-ddt", "0");
+      encoder->SetOption("enable-cctx", "0");
+      encoder->SetOption("enable-ccso", "0");
+      encoder->SetOption("enable-ext-partitions", "0");
+      encoder->SetOption("enable-pc-wiener", "0");
+      encoder->SetOption("enable-wiener-nonsep", "0");
+      encoder->SetOption("enable-ibp", "0");
+      encoder->SetOption("enable-refmvbank", "0");
+      encoder->SetOption("enable-opfl-refine", "0");
+      encoder->SetOption("enable-lf-sub-pu", "0");
+      encoder->SetOption("enable-adaptive-mvd", "0");
+      encoder->SetOption("enable-flex-mvres", "0");
+      encoder->SetOption("enable-joint-mvd", "0");
+      encoder->SetOption("enable-refinemv", "0");
+      encoder->SetOption("enable-mvd-sign-derive", "0");
+      encoder->SetOption("enable-parity-hiding", "0");
+      encoder->SetOption("enable-warp-delta", "0");
+      encoder->SetOption("enable-warp-extend", "0");
+      encoder->SetOption("max-drl-refmvs", "0");
+      encoder->SetOption("max-drl-refbvs", "0");
     }
   }
 
@@ -102,10 +133,10 @@ class RtcTestLarge : public ::libavm_test::CodecTestWithParam<int>,
   int tune_content_;
 };
 
-TEST_P(RtcTestLarge, RtcTest) {
-  ::libavm_test::Y4mVideoSource video_nonsc("niklas_1280_720_30.y4m", 0, 5);
+TEST_P(RtcTest, RtcTest) {
+  ::libavm_test::Y4mVideoSource video_nonsc("niklas_1280_720_30.y4m", 0, 50);
   ASSERT_NO_FATAL_FAILURE(RunLoop(&video_nonsc));
 }
 
-AV2_INSTANTIATE_TEST_SUITE(RtcTestLarge, ::testing::Range(0, 2));
+AV2_INSTANTIATE_TEST_SUITE(RtcTest, ::testing::Range(0, 2));
 }  // namespace

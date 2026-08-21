@@ -304,6 +304,21 @@ typedef struct GLOBAL_MOTION_SPEED_FEATURES {
   int disable_gm_search_based_on_stats;
 } GLOBAL_MOTION_SPEED_FEATURES;
 
+// Levels for the two-pass superblock partition search. In both enabled levels
+// the first ("dry") pass works out a rough partition shape down to 16x16, and
+// the second ("wet") pass codes the superblock for real while trusting the
+// dry-pass shape for blocks of 32x32 and larger.
+enum {
+  TWO_PASS_PART_OFF = 0,
+  // The dry pass runs the full tool set, and the wet pass trusts every shape
+  // of 32x32 and larger, including blocks the dry pass left unsplit.
+  TWO_PASS_PART_CONSERVATIVE = 1,
+  // The dry pass runs a reduced tool set (see DryPassCfg), and the wet pass
+  // re-searches unsplit blocks up to 128 px and narrows the mode pool on the
+  // shapes it reuses.
+  TWO_PASS_PART_FAST = 2,
+};
+
 typedef struct PARTITION_SPEED_FEATURES {
   PARTITION_SEARCH_TYPE partition_search_type;
 
@@ -399,6 +414,10 @@ typedef struct PARTITION_SPEED_FEATURES {
   // Prunes PARTITION_HORZ/VERT_4B based on PARTITION_HORZ/VERT_4A result.
   int prune_part_4b_with_part_4a;
 
+  // Two-pass superblock partition search level: one of TWO_PASS_PART_OFF,
+  // TWO_PASS_PART_CONSERVATIVE or TWO_PASS_PART_FAST. Decided once per frame in
+  // set_two_pass_partition_level(); read through av2_two_pass_part_enabled()
+  // and av2_two_pass_part_is_fast().
   int two_pass_partition_search;
 
   // Prunes rect partition with ml model
@@ -441,6 +460,8 @@ typedef struct PARTITION_SPEED_FEATURES {
   //    intra coded block, prunes when inter ratio exceeds 50%, and early skips
   //    when current best partitioning is PARTITION_NONE.
   int inter_sdp_fast_method_level;
+  // Prune partition types if they don't align with neighbor block boundaries.
+  int prune_part_with_neighbor_boundaries;
 #if CONFIG_ML_PART_SPLIT
   int prune_split_with_ml;
   int prune_split_ml_level;
@@ -459,7 +480,25 @@ typedef struct PARTITION_SPEED_FEATURES {
 
   bool disable_ext_partitions;
   bool disable_uneven_4way_partitions;
+  bool disable_extended_sdp;
+
+  // Force the max partition-block aspect ratio
+  unsigned int force_max_pb_aspect_ratio;
 } PARTITION_SPEED_FEATURES;
+
+// True when the two-pass superblock partition search runs at all.
+static INLINE bool av2_two_pass_part_enabled(
+    const PARTITION_SPEED_FEATURES *part_sf) {
+  return part_sf->two_pass_partition_search != TWO_PASS_PART_OFF;
+}
+
+// True when the two-pass search runs in its faster regime: a reduced-tool dry
+// pass, a wet pass that re-searches unsplit blocks, and a narrowed mode pool on
+// reused shapes.
+static INLINE bool av2_two_pass_part_is_fast(
+    const PARTITION_SPEED_FEATURES *part_sf) {
+  return part_sf->two_pass_partition_search >= TWO_PASS_PART_FAST;
+}
 
 typedef struct MV_SPEED_FEATURES {
   // Motion search method (Diamond, NSTEP, Hex, Big Diamond, Square, etc).
@@ -536,8 +575,13 @@ typedef struct MV_SPEED_FEATURES {
   // Method to use for refining WARP_CAUSAL motion vectors
   WARP_SEARCH_METHOD warp_search_method;
 
+  // Method to use for refining WARP_CAUSAL motion vectors on secondary
+  // reference frames during coarse inter-mode search
+  WARP_SEARCH_METHOD warp_search_method_sec_ref;
+
   // Maximum number of iterations in WARP_CAUSAL refinement search
   int warp_search_iters;
+
   // Use faster motion search settings for partition blocks with at least one
   // dimension that's >= 256
   int fast_motion_estimation_on_block_256;
@@ -573,6 +617,9 @@ typedef struct INTER_MODE_SPEED_FEATURES {
   // Has five levels for now: 0, 1, 2, 3 and 4, where higher levels prune more
   // aggressively than lower ones. (0 means no pruning).
   int selective_ref_frame;
+
+  // Enable fast warp delta search for 4 param and 6 param models
+  int fast_warp_delta_decoupled_search;
 
   // When 1, prune single-ref NEWMV / WARP_NEWMV for a given ref frame
   // when the best RD seen so far for that ref (taken from a prior mode
@@ -783,6 +830,14 @@ typedef struct INTER_MODE_SPEED_FEATURES {
   // current best mode is not the same mode as the one being evaluated, because
   // AMVD on top of these modes is unlikely to win over the non-AMVD best mode.
   int prune_amvd_newmv;
+
+  // Prune further evaluation of compound mode using estimated RD Cost of best
+  // compound type chosen.
+  bool prune_comp_mode_eval_using_est_rd;
+
+  // Prune the evaluation of ref_mv_idx > 0 for WARP_NEWMV modes based on RD
+  // Cost of ref_mv_idx = 0 and best mode so far.
+  bool prune_warp_newmv_ref_mv_idx;
 } INTER_MODE_SPEED_FEATURES;
 
 typedef struct INTERP_FILTER_SPEED_FEATURES {
@@ -990,6 +1045,20 @@ typedef struct LOOP_FILTER_SPEED_FEATURES {
 
   // enable deblock for block partition search
   int enable_deblock_for_partition_search;
+
+  // early terminate ccso search by cost threshold
+  int early_terminate_ccso_search_by_cost;
+
+  // If set, trim the RU-size candidate set by pyramid_level in
+  // av2_pick_filter_restoration() (see pickrst.c). Default 0 = full search.
+  int reduce_lr_unit_size_by_pyr;
+
+  // Sub-flag of reduce_lr_unit_size_by_pyr. If set, also drop the smallest RU
+  // size at deep pyramid levels. Default 0 keeps the smallest size available.
+  int reduce_lr_unit_size_by_pyr_drop_low;
+
+  // bypass ccso luma plane check
+  int ccso_chroma_dep;
 } LOOP_FILTER_SPEED_FEATURES;
 
 typedef struct REALTIME_SPEED_FEATURES {

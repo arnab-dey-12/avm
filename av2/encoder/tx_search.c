@@ -2692,8 +2692,8 @@ static void search_tx_type(const AV2_COMP *cpi, MACROBLOCK *x, int plane,
 #endif  // CONFIG_COLLECT_RD_STATS == 1
 
 #if COLLECT_TX_SIZE_DATA
-        record_tx_type_info(cpi, x, plane, block, plane_bsize, blk_row, blk_col,
-                            tx_size, packed_tx_type, rd);
+        collect_tx_size_data(x, plane, blk_row, blk_col, plane_bsize, tx_size,
+                             packed_tx_type, rd);
 #endif  // COLLECT_TX_SIZE_DATA
 
         assert(tx_sf->adaptive_tx_type_search_idx < 6);
@@ -3406,7 +3406,8 @@ static AVM_INLINE void choose_largest_tx_size(const AV2_COMP *const cpi,
   const int64_t no_skip_txfm_rd = is_inter_block(mbmi, xd->tree_type)
                                       ? RDCOST(x->rdmult, no_skip_txfm_rate, 0)
                                       : 0;
-  const int skip_trellis = 0;
+  // Dry pass: skip trellis (no RDOQ) — light quant only.
+  const int skip_trellis = x->apply_dry_pass_shortcuts ? 1 : 0;
   av2_txfm_rd_in_plane(x, cpi, rd_stats, ref_best_rd,
                        AVMMIN(no_skip_txfm_rd, skip_txfm_rd), AVM_PLANE_Y, bs,
                        FTXS_NONE, skip_trellis);

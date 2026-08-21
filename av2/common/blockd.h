@@ -562,6 +562,10 @@ typedef struct MB_MODE_INFO {
   uint8_t joint_y_mode_delta_angle;
   /*! \brief re-ordered mode list for y mode and y delta angle. */
   uint8_t y_intra_mode_list[LUMA_MODE_COUNT];
+  /*! \brief How many entries at the start of y_intra_mode_list are the most
+   * probable modes, i.e. the ones taken from neighbouring blocks. The rest of
+   * the list is filled with a fixed default order. */
+  uint8_t num_y_intra_mpm;
   /*! \brief re-ordered mode list for uv mode. */
   uint8_t uv_intra_mode_list[UV_INTRA_MODES];
   /**@}*/
@@ -1794,10 +1798,10 @@ typedef struct cfl_ctx {
 #endif  // CONFIG_DEBUG
 } CFL_CTX;
 
-typedef struct dist_wtd_comp_params {
+typedef struct cwp_params {
   int fwd_offset;
   int bck_offset;
-} DIST_WTD_COMP_PARAMS;
+} CWP_PARAMS;
 
 struct scale_factors;
 

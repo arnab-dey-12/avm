@@ -70,6 +70,7 @@ typedef struct prequant_t {
   int32_t absLevel[4];
   int64_t deltaDist[4];
   int16_t qIdx;
+  int16_t orig_qIdx;
 } prequant_t;
 
 typedef struct tcq_rate_t {
@@ -227,8 +228,8 @@ static INLINE int get_br_cost_tcq(tran_low_t level, const int *coeff_lps) {
  */
 int av2_trellis_quant(const struct AV2_COMP *cpi, MACROBLOCK *x, int plane,
                       int block, TX_SIZE tx_size, TX_TYPE tx_type,
-                      CctxType cctx_type, const TXB_CTX *const txb_ctx,
-                      int *rate_cost, int sharpness);
+                      const TXB_CTX *const txb_ctx, int *rate_cost,
+                      int sharpness);
 
 #ifdef __cplusplus
 }
